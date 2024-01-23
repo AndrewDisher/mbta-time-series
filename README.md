@@ -34,7 +34,7 @@ was at its yearly seasonal apex, and began to slightly trend downwards to compen
 
 ARIMA could never have done that, and Dynamic Harmonic Regression, while able to to, didn't produce great forecasts. 
 
-## Local Project Download
+## Local Project Download & Dependecy Installation
 
 To view each of the files in a local project, first clone this repository or download the files in a .zip file. 
 
