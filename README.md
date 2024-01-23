@@ -84,7 +84,7 @@ For custom functions imported by box, you can first run the code to import a box
 box::use(functions/plotting[time_series])
 ```
 
-and then, as an example, ask for the documentation for the function `model_diagnostics` by running
+and then, as an example, ask for the documentation for the histogram plotting function `plotHist` by running
 
 ```
 box::help(time_series$plotHist)
