@@ -1,0 +1,1407 @@
+---
+title: "Forecasting MBTA Ferry Ridership"
+author: "Andrew Disher"
+date: "2024-01-19"
+output: 
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    css: "custom_style.css"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{css, echo=FALSE}
+
+```
+
+**This document records my efforts to model MBTA ferry ridership data with various time series models. 
+The data, provided by the Massachusetts Bay Transport Authority, is available at their 
+[open data portal](https://mbta-massdot.opendata.arcgis.com/). It is located within the section titled 
+Ridership, under Data By Category, and can be found [here](https://mbta-massdot.opendata.arcgis.com/search?tags=ridership).**
+
+## Goals of this Project
+
+1. Aggregate the data according to day, since it is stored as boat trips with passenger counts.
+2. Identify any outliers or missing data, and perform data imputation if necessary.
+3. Perform time series cross validation during model selection.
+4. Identify suitablee models for forecasting. Modeling methods considered include ARIMA, ETS, and Dynamic Harmonic Regression. 
+5. Produce forecasts to compare models' performance. 
+6. Produce a combination forecast, averaging the point forecasts of each model and creating a combined prediction interval. This is a form of *ensemble forecasting*.
+
+## 1 Import necessary packages and functions
+
+```{r, message=FALSE}
+box::use(
+  dplyr[`%>%`, arrange, case_when, group_by, filter, mutate, pull, row_number, select,
+        summarize, ungroup],
+  fable[...],
+  fabletools[...],
+  feasts[ACF, guerrero, PACF, STL],
+  generics[augment, glance],
+  ggplot2[...],
+  gridExtra[...],
+  gt[cell_fill, cells_body, gt, tab_footnote, tab_header, tab_style],
+  imputeTS[ggplot_na_distribution, ggplot_na_imputations, na_interpolation],
+  lubridate[day, hour, month, year],
+  MASS[fitdistr],
+  tidyr[everything, pivot_longer, pivot_wider],
+  tsibble[...],
+)
+```
+
+```{r}
+box::use(
+  functions/plotting[time_series]
+)
+```
+
+
+### 1.1 Notes on Packages Used 
+
+We have decided to use the `box` package to handle our package imports, since it makes more
+explicit what functions we will be using in our analyses. Package imports with [...]
+declared simply imply that we'll be importing all functions from those packages, similar
+to `library()` calls, which is done only for some packages since we use so many of their functions
+in this document. 
+
+Box also allows us to import our custom functions, written in files stores within this project, 
+as well. This is useful because we can also create documentation for these functions
+with `roxygen2` style decorators. So, if you would like to examine the code within the 
+*forecasting.R* file, you can call `box::help(module_name$function_name)` and be provided 
+insights from help pages on how to use such functions in the code. This functionality
+is very similar to a package's help page functionality, with the added benefit of 
+not creating a package. 
+
+Data manipulation will be performed mainly using packages like `dplyr`, but we also import 
+`lubridate` for easier ways to work with dates in R, `tidyr` to convert data frames from
+long format to wide format (and vice versa). `ggplot2` is used as our primary graphing 
+library, along with the `grid` package to help arrange plots side by side. `tsibble` provides a
+unique tibble format for our time series data be stored in, which has special properties that
+make it more convenient to work with compared to data frames and traditional tibbles. 
+
+Our tools for estimating and fitting time series models come from a variety of packages, 
+including `fable`, `fabletools`, and `feasts`. These provide ways to work with and fit models 
+in a **tidymodels** style, which makes use of pipes in our code for cleaner and 
+more readable code. 
+
+## 2 Data Cleaning
+
+### 2.1 Examing the Data Set Structure
+
+First, we'll import the data and see what it looks like.
+
+```{r}
+ferry_ridership <- read.csv("data/ferry_ridership.csv")
+
+str(ferry_ridership, vec.len = 2)
+```
+
+There is a lot of information about thinks such as service date, scheduled departures, 
+and about the trip itself, like its direction and destination. 
+
+Many of the variables in the original data set are not really needed, so I will remove
+the ones that wont be necessary. We'll only keep the variables for `actual_departure` time
+and `pax_on`, which just tells us how many passengers boarded the vessel. 
+
+```{r}
+ferry_ridership <- ferry_ridership %>% 
+  select(c(actual_departure, pax_on, ))
+
+str(ferry_ridership, vec.len = 2)
+```
+
+`actual_departure` is a character vector, which will help us create numerous other variables
+for day, day of week, month, and year, as well as an R Date vector. 
+
+```{r}
+ferry_ridership <- ferry_ridership %>% 
+  mutate(actual_departure = as.POSIXct(actual_departure),
+         year = year(actual_departure),
+         month = month(actual_departure),
+         day = day(actual_departure),
+         hour = hour(actual_departure)) %>% 
+  mutate(new_date = paste0(year, "-", month, "-", day) %>% 
+           as.Date(format = "%Y-%m-%d"),
+         DOW = weekdays(new_date)) %>% 
+  filter(!(DOW %in% c("Saturday", "Sunday")))
+
+ferry_ridership %>% 
+  head()
+```
+
+Very nice. A good idea would be to check the range of dates that we are working with.
+
+```{r}
+ferry_ridership$new_date %>% 
+  range(na.rm = TRUE)
+```
+
+Our data spans from November of 2018 to August of of 2023. This is good, since we'll 
+have plenty of data to help establish various seasonal cycles that will certainly 
+be present in such data as this. 
+
+You'll notice we specified the argument `na.rm = TRUE`; this is because there are NAs
+in our data, which prevents the `range` function from doing its job. Now that we know
+what our date range is, we'll proceed to examine these missing values. 
+
+### 2.2 Missing Values
+
+The variable we are interested in is `pax_on`. Again, this variable tells us how many
+passengers boarded a vessel on a given trip. We are interested in creating time series 
+models for daily data, so we will end up aggregating it. 
+
+Before we do so, we should check to see if `pax_on` contains missing values in case 
+they might present us with issues in aggregation. 
+
+```{r}
+ferry_ridership[is.na(ferry_ridership$pax_on),] %>% 
+  select(new_date) %>% 
+  unique()
+```
+
+It turns out we have a number of dates with missing values. Some dates have multiple
+trips that have missing values, while some have missing values for `pax_on` for ALL
+trips that were scheduled for that day. 
+
+This is going to pose an issue with our data aggregation, especially since we want to 
+use our boardings variable to create a new variable for average number of boardings 
+per day. 
+
+So, what we'll do is aggregate our data by day, and then examine the specific days 
+where all of the trips for that day were NAs. 
+
+```{r, message=FALSE}
+daily_ridership <- ferry_ridership %>% 
+  group_by(year, month, day, new_date) %>% 
+  summarize(boardings = sum(pax_on, na.rm = TRUE),
+            avg_boardings = mean(pax_on, na.rm = TRUE)) %>% 
+  ungroup()
+
+daily_ridership[is.na(daily_ridership$avg_boardings), ] %>% 
+  select(new_date) 
+```
+
+We have three dates of interest. After some research, I discovered that on January 17th, 2022
+the east of coast Massachusetts experienced some high velocity winds (50-70 mph). These winds, along
+with some heavy rain suspended ferry service due to unsafe conditions. On March 14th, 2023 
+there was a Nor'Easter with heavy rains and some coastal flooding, which must also have been 
+responsible for a suspension of service. 
+
+I was not able to identify the reason for missing values for November 24th, 2022, however the fact remains 
+that we have missing values. For these reasons, we are going to impute some values for these dates
+in our time series using a data interpolation technique included in the `imputeTS` package. 
+
+In addition, I was able to identify one last Date, December 17th, 2020, where a severe 
+Nor'Easter again hit the east coast of the entire Northeast United States. I found many articles
+explaining that the MBTA again suspended ferry service on this date. Boston ended 
+up getting a foot of snow, which was more than the entire previous Winter combined. However, zeros 
+where logged, instead of NAs, which explains why we couldn't find it through our data set search before. 
+
+### 2.3 Covid-19 Pandemic
+
+Before we start interpolating data to impute values for the dates mentioned before, 
+I think it is worth it to first acknowledge a certain reality in our data. 
+
+Our data contains the period when the Covid-19 pandemic happened. I know for a 
+fact that the MBTA suspended ferry service for a time when the pandemic began. 
+This is reflected in our data if we look at the rows below. 
+
+```{r}
+daily_ridership[352, "new_date"]
+daily_ridership[353, "new_date"]
+```
+
+This is a large gap in data that no amount of data interpolation can solve, so 
+unfortunately we will have remove the observations in the data set that occur before 
+June 22nd, 2020. This is likely a good thing anyways, since the ridership trends in the 
+first few months of the pandemic would have undoubtedly been far different than typical ridership
+trends. 
+
+```{r}
+post_covid_daily_ridership <- daily_ridership %>% 
+  filter(new_date >= as.Date("2020-06-22")) %>% 
+  mutate(day_index = row_number()) %>% 
+  as_tsibble(index = day_index) 
+
+post_covid_daily_ridership$new_date %>% 
+  range()
+```
+
+You'll see we also created a new variable, called `day_index.` This will help with our data modeling, 
+which will become more obvious later. 
+
+### 2.4 Data Imputation
+
+We'll begin by creating a simple vector of dates that we'll dub *problem dates* and use 
+it to help us impute our data. 
+
+```{r}
+problem_dates <- as.Date(c("2020-12-17", "2022-01-17", "2022-11-24", "2023-03-14"))
+```
+
+As a reminder, this is what our data looks like.
+
+```{r}
+post_covid_daily_ridership %>% 
+  filter(new_date %in% problem_dates)
+```
+
+The values of concern are in the `avg_boardings` column. We'll convert these values to
+NAs so `imputeTS` functions can identify which values we'd like to treat. 
+
+```{r}
+post_covid_daily_ridership <- post_covid_daily_ridership %>% 
+  mutate(avg_boardings = case_when(is.nan(avg_boardings) ~ NA,
+                                   new_date == as.Date("2020-12-17") ~ NA,
+                                   TRUE ~ avg_boardings))
+```
+
+Below, we visualize the sections of our time series that we'd like to impute values for. 
+
+```{r}
+ggplot_na_distribution(post_covid_daily_ridership$avg_boardings)
+```
+
+We'll use the `na_interpolation()` function from `imputeTS` to impute values using 
+a spline interpolation technique. There are many techniques available in the package, 
+but for our data they produced almost identical results when I tested them. 
+
+```{r}
+interp <- na_interpolation(post_covid_daily_ridership$avg_boardings, option = "spline", method = "natural")
+```
+
+To visualize the results we can run the following code. 
+
+```{r}
+ggplot_na_imputations(post_covid_daily_ridership$avg_boardings, interp)
+```
+
+The results look acceptable to me, so we'll go ahead and replace our data with the interpolated 
+data. 
+
+```{r}
+post_covid_daily_ridership <- post_covid_daily_ridership %>% 
+  mutate(avg_boardings = interp)
+```
+
+## 3 Data Visualization
+
+### 3.1 Daily Average Ferry Boardings
+
+Now that we have cleaned our data, we can begin to examine some of the trends in
+it. First, we'll plot the time series again for average boardings and then check its ditribution. 
+We create these plots using functions that I have defined, which can be found in the
+`functions/plotting` directory of the github repository this code is in. 
+
+```{r, fig.width=10, fig.height=4}
+grid.arrange(
+  time_series$plotTS(data = post_covid_daily_ridership,
+                     date_var = "new_date",
+                     y_var = "avg_boardings",
+                     y = "Average Boardings",
+                     title = "Average Daily Ferry Boardings"), 
+  time_series$plotHist(data_vec = post_covid_daily_ridership$avg_boardings,
+                      title = "Distribution of Average Boardings Variable"),
+  ncol = 2
+)
+```
+
+We can see from the histogram that the distribution is a bit right-skewed, since we do
+tend to see a decent number of extreme values in our series. This could be due to holidays,
+where public transportation might experience higher passengers volumes. While we do 
+discuss seasonality in our models later, we will not consider seasonality in yearly holidays. 
+
+Also, we can see that our time series exhibits heteroschedasticity; it has non-constant
+variance, which will impact our models in a large way. Therefore, we should explore the use 
+of transformations, namely Box-Cox transformations, for our dependent variable. 
+
+Before doing so, let's take a look at the autocorrelation function (ACF) and partial 
+autocorrelation function (PACF) for our time series. 
+
+```{r, fig.width=10, fig.height=4}
+grid.arrange(
+  post_covid_daily_ridership %>% 
+    ACF(boardings) %>% 
+    autoplot() +
+    theme_minimal() +
+    labs(x = "Lag",
+         y = "ACF"),
+  post_covid_daily_ridership %>% 
+    PACF(boardings) %>% 
+    autoplot() +
+    theme_minimal() +
+    labs(x = "Lag",
+         y = "PACF"),
+  ncol = 2)
+```
+
+These graphics are incredibly useful when working with time series data, and will 
+prove to be absolutely necessary when creating the ARIMA model we mentioned earlier. 
+
+The ACF is showing us the correlations between values of our series between previous 
+values in the series, thus *auto*-correlation. There is significant autocorrelations
+for many lags in our data, indicating that the previous values in the series will
+be useful for predicting future values. 
+
+The PACF is similar to the ACF, except that it removes removes any *partial* correlations
+that are introduced with lags between the two lags of interest. In other words, when we 
+would like to see if the value at time *t* in our series is correlated with the value
+at time *t-8*, partial correlations existing between lag 8 and lag 5, for example, 
+tend to inflate the correlation between lag 8 and our current value. The PACF removes
+these confounding correlations, and gives us an more *pure* correlation between lag 8 and
+our current value. We also see significant correlation here. 
+
+In both cases, we see some obvious seasonality. It's probably easier to see in the 
+ACF. There are many repeated jumps in the hight of the lags, every 5 lags. This makes
+sense because our data is not just weekly data, but it is data for the weekdays. Therefore, 
+we would expect a periodicity of 5. The chart below makes this idea more concrete.
+
+```{r, warning=FALSE, fig.width=12, fig.height=4}
+level_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+
+post_covid_daily_ridership %>% 
+  mutate(DOW = weekdays(new_date),
+         group_var = rep(1:165, each = 5)) %>% 
+  ggplot(mapping = aes(x = factor(DOW, level = level_order),
+                       y = avg_boardings, 
+                       group = group_var, 
+                       color = group_var)) +
+  geom_line() + 
+  theme_minimal() +
+  theme(legend.position = "none") +
+  facet_wrap(vars(month)) +
+  labs(x = "Day of the Week",
+       y = "Average Daily Ferry Boardings")
+```
+
+The chart is faceted according to month, which helps us eliminate some of the yearly
+seasonality that confounds with the weekly seasonality. While the data is taken from 
+different years, and we have an overall increasing trend (by looking at the time series chart
+from before), it is still clear that within each month we can see an obvious arch
+shape, indicating that Wednesdays (and to some extent Mondays and Thursdays) tend to 
+experience higher passenger volumes than the other days of the week. More people
+take the ferry on days near the middle of the week than on Mondays and Fridays. 
+
+### 3.2 Box-Cox Transformations
+
+In order to reduce the adverse effects that non-constant variance will have on our models, 
+we can transform our variable, average boardings, such that it exhibits more homoschedasticity.
+
+We can first run this R code to learn what the most optimal transformation will be 
+for this hyperparameter.
+
+```{r}
+lambda <- post_covid_daily_ridership %>% 
+  features(avg_boardings, features = guerrero) %>% 
+  pull(lambda_guerrero) 
+
+lambda
+```
+
+This lambda value is estimated using the Guerrero estimation method, rather than 
+log-likelihood. Guerrero's method has proven to be more effective when dealing with time series
+data, which makes it more suitable here than with linear regression, for example. 
+
+We get an optimal lambda value of about 0.28. In many situations, rounding this value may be 
+important to preserve some of the interpretive value, but in our use-case, we'll 
+simply use it as is, since we are more interested in producing the most optimal 
+forecasts. 
+
+This lambda value will be used in a Box-Cox transformation, which you can read more about it
+[here](https://en.wikipedia.org/wiki/Power_transform#Box%E2%80%93Cox_transformation), if you are interested. 
+
+We'll apply the transformation below.
+
+```{r}
+post_covid_daily_ridership <- post_covid_daily_ridership %>% 
+  mutate(avg_boardings_trans = box_cox(avg_boardings + 1, lambda))
+```
+
+Now, we can view the results of the transformation by plotting in the same way we did 
+for the original series. 
+
+```{r, fig.width=10, fig.height=4}
+grid.arrange(
+  time_series$plotTS(data = post_covid_daily_ridership,
+                     date_var = "new_date",
+                     y_var = "avg_boardings_trans",
+                     y = "Average Boardings",
+                     title = "Transformed Average Daily Ferry Boardings"),
+  time_series$plotHist(data_vec = post_covid_daily_ridership$avg_boardings_trans,
+                       title = "Distribution of Transformed Average Boardings Variable"),
+  ncol = 2
+)
+```
+
+You'll notice that the variance seems much more constant throughout the series,
+which means that our ARIMA model will perform better once we start trying to model it. 
+This is because ARIMA models depend on a certain set of assumptions, which include stationarity
+in the mean and stationarity in the variance. 
+
+You'll also notice that the unit scale of the boardings variable has now changed 
+drastically, but that is OK. Once we obtain forecasts for a model, we can back-transform 
+the variable using the inverse transform function to obtain forecasts on the original scale. 
+
+We can also examine the autocorrelation functions mentioned earlier and observe that
+the underlying correlation structure remains largely intact compared to what we
+had before. The same weekly seasonality exists. 
+
+```{r, fig.width=10, fig.height=4}
+grid.arrange(
+  post_covid_daily_ridership %>% 
+    ACF(avg_boardings_trans) %>% 
+    autoplot() +
+    theme_minimal() +
+    labs(x = "Lag",
+         y = "ACF"),
+  post_covid_daily_ridership %>% 
+    PACF(avg_boardings_trans) %>% 
+    autoplot() +
+    theme_minimal() +
+    labs(x = "Lag",
+         y = "PACF"),
+  ncol = 2
+)
+```
+
+## 4 ARIMA Modeling
+
+### 4.1 Small Discussion of ARIMA
+
+Now that we have a suitable data set, we can begin modeling. The first model 
+that we will try is ARIMA. ARIMA stands for autoregressive integrated moving average, 
+and this model has been one of the go tos for many time series forecasters. It can be extended 
+to accommodate some different types of seasonality, but not all. 
+
+To specify ARIMA(*p*, *d*, *q*) models, you must choose choose the values for the 
+*p*, *d*, and *q* parameters based off of what is observed in the ACF and PACF plots we have been
+looking at. You can read more about specifying and iteratively re-fitting models
+using these plots [here](https://otexts.com/fpp3/arima.html). We will not go too in depth
+discussing how to fit an ARIMA model here, since it is a lengthy process. 
+
+### 4.2 Comparing AICc and BIC of Models
+
+After applying sufficient differencing and seasonal differencing transformations to
+the data, I was able to identify a suite of potential models, some simple and some
+more complex. 
+
+```{r}
+arima_models <- post_covid_daily_ridership %>%
+  model(
+    seasonal_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 0, 0) + PDQ(0, 1, 0, period = 5)),
+    arima_000_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 0, 0) + PDQ(0, 1, 1, period = 5)),
+    arima_100_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(1, 0, 0) + PDQ(0, 1, 1, period = 5)),
+    nonseasonal_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 0, 0, period = 5)),
+    double_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 1, 0, period = 5)),
+    arima_010_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 1, 1, period = 5)),
+    arima_011_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 1) + PDQ(0, 1, 1, period = 5)),
+    arima_012_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 2) + PDQ(0, 1, 1, period = 5)),
+    arima_111_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(1, 1, 1) + PDQ(0, 1, 1, period = 5)),
+    auto_fit = ARIMA(box_cox(avg_boardings, lambda)),
+  )
+```
+
+We can see the model specs here,
+
+```{r}
+arima_models %>% 
+  pivot_longer(everything(), 
+               names_to = "Model", 
+               values_to = "Orders")
+```
+
+and we can create a comparison of the models using information criteria like AICc
+and BIC. 
+
+```{r}
+glance(arima_models) %>% 
+  arrange(AICc) %>% 
+  select(.model:BIC)
+```
+
+It is worth noting that we can only make valid comparisons between models when 
+they have been trained on the same data. Some of these models have different amounts
+of differencing applied, which by definition removes some of the data. So, only models 
+with the same orders of differencing are comparable. We'll also be performing cross-validation
+with our models later, so that we can make valid comparisons between them all using 
+different metrics. 
+
+It seems like, between the top three models, ARIMA(1, 1, 1)(0, 1, 1) has identical 
+values for every information criterion as ARIMA(0, 1, 2)(0, 1, 1). These both seem like they'd
+be worth testing further. 
+
+### 4.3 Model Diagnostics
+
+Let's store this new information in an object and then use it to create some 
+diagnostic plots. 
+
+```{r, fig.width=10, fig.height=5, results='hide'}
+# Store important information, like residuals, in a new data frame
+arima_model_info <- augment(arima_models)
+
+arima_model_info %>% 
+  filter(.model == "arima_111_011") %>% 
+  as.data.frame() %>% 
+  select(.resid) %>%
+  unlist() %>% 
+  unname() %>% 
+  time_series$model_diagnostics()
+```
+
+The diagnostic plots above show that just about all the autocorrelation in the residuals 
+has been removed, since the lines in both the ACF and PACF are now within the blue
+confidence limits. For the most part, our ordered residual plot shows no bad signs,
+since the series is quite stationary in the mean. 
+
+Our Box-Cox transformation may not have been enough to make the series have constant variance, 
+since the variance up until the 200th observation is certainly different from what comes after. 
+We'll have to see later if this poses and issue. 
+
+One last thing to note is that the residual distribution and the Normal QQ Plot show
+that the residuals are close to but definitely not normally distributed. ARIMA models
+assume that the residuals follow a Gaussian white noise process. This assumption 
+is important because when we forecast values, we like to generate prediction intervals
+to represent a margin for error. 
+
+Although the point forecasts will still be accurate, the intervals will not be if the 
+residuals are not normally distributed. However, we can circumvent this issue by 
+generating bootstrapped estimates for our intervals. So, having non-gaussian white 
+noise residuals is completely fine in our case. As long as they are centered around 
+zero and form a relatively symmetric distribution (they do), we're looking good. 
+
+The other model we were interested in was ARIMA(0, 1, 2)(0, 1, 1). It's diagnostic 
+plots can be seen below, and they are almost identical to the previous ones. 
+
+```{r, fig.width=10, fig.height=5, results='hide'}
+arima_model_info %>% 
+  filter(.model == "arima_012_011") %>% 
+  as.data.frame() %>% 
+  select(.resid) %>%
+  unlist() %>% 
+  unname() %>% 
+  time_series$model_diagnostics()
+```
+
+Since our residuals are consistently not normal, I figured it would be worth testing to see
+if a t-distribution better described them. 
+
+```{r, warning=FALSE}
+# Store model residuals
+arima_012_011_resid <- arima_model_info %>% 
+  filter(.model == "arima_012_011") %>% 
+  as.data.frame() %>% 
+  select(.resid) %>%
+  unlist() %>% 
+  unname() 
+
+# Empirically estimate the residual t-distribution parameters
+dist_params <- as.list(fitdistr(arima_012_011_resid, "t")$estimate)
+
+# Generate plot
+time_series$plotQQ(data_vec = arima_012_011_resid,
+                   title = "T-Distribution QQ Plot of Model Residuals",
+                   dist_func = stats::qt,
+                   dparams = dist_params["df"])
+```
+
+This is certainly the case. Our t-distribution better accounts for the heavy tails
+that our residuals have. This confirms that our residuals are white noise, albeit not Gaussian
+white noise, which means we can simply bootstrap our prediction intervals to obtain
+accurate estimates. 
+
+### 4.4 Time Series Cross-Validation
+
+As with most other prediction probelems in statistical modeling and machine learning, 
+cross-validation is extremely important with time series forecasting. The goal of 
+cross-validation is to help us choose a model that generalizes well to new data. 
+
+Time series cross-validation is very different from typical cross-validation though, 
+since we can't simply randomly sample the data for training and testing subsets. Time series
+data has a sequential structure, through time, and values depend on values that 
+come immediately before it. So, we implement blocked-rolling window cross-validation.
+
+The image below describes the idea succinctly.
+
+![Blocked Time Series CV](https://miro.medium.com/v2/resize:fit:1400/1*TUNRj8Y4-8On9ordDHZWpA.png)
+A subset of a reasonable size is chosen (in our case 100 observations) and is used to 
+train the models, which then produce forecasts. The forecasts are compared to the actual
+values that the models have not seen, and error metrics are calculated, like Root Mean Squared Error (RMSE).
+Then the training subset **window** slides to use a new subset of training and testing 
+data. The process is performed iteratively until we use all available subsets of data and the error
+metics for each model are aggregated. Then we can compare the results in a table. 
+
+However, also like most other models, time series cross-validation is very resource 
+intensive and take a long time to complete. That is because we continuously fit hundreds 
+or thousands of models on many subsets of the training data. 
+
+As a result, we can't include the running code for it in our notebook, but I do 
+provide a commented out codeblock that you can try running yourself with the data
+in the repository.
+
+```{r}
+# # Create blocked subsets of the data (training sets contains 100 observations each)
+# cv_data <- post_covid_daily_ridership %>% 
+#   slide_tsibble(.size = 100, .step = 1) %>% 
+#   filter(!(.id %in% max(.id):(max(.id) - 13)))
+#   
+# # Create a models using each of these training sets to obtain 
+# cv_arima_results <- cv_data %>% 
+#   model(
+#     seasonal_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 0, 0) + PDQ(0, 1, 0, period = 5)),
+#     arima_000_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 0, 0) + PDQ(0, 1, 1, period = 5)),
+#     arima_100_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(1, 0, 0) + PDQ(0, 1, 1, period = 5)),
+#     nonseasonal_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 0, 0, period = 5)),
+#     double_diff = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 1, 0, period = 5)),
+#     arima_010_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 0) + PDQ(0, 1, 1, period = 5)),
+#     arima_011_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 1) + PDQ(0, 1, 1, period = 5)),
+#     arima_012_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 2) + PDQ(0, 1, 1, period = 5)),
+#     arima_111_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(1, 1, 1) + PDQ(0, 1, 1, period = 5))
+#     ) %>% 
+#   forecast(h = 14) %>% 
+#   accuracy(post_covid_daily_ridership) %>% 
+#   arrange(RMSE)
+```
+
+I've also included the results of the cross-validation in a table
+below. 
+
+```{r}
+cv_arima_results <- data.frame(.model = c("arima_100_011", "arima_000_011", "arima_111_011", "arima_012_011", "arima_011_011", "seasonal_diff", 
+                                    "nonseasonal_diff", "arima_010_011", "double_diff"),
+                         .type = rep("Test", times = 9),
+                         ME = c(0.14783304, 0.02746709, -0.35253126, -0.34327737, -0.46380207, -0.68752152, -3.14639798, -3.44304494, -13.05370873),
+                         RMSE = c(3.223771, 3.271745, 3.285186, 3.289071, 3.397887, 3.835413, 6.224038, 6.640184, 23.898601),
+                         MAE = c(2.440754, 2.462462, 2.424498, 2.420800, 2.483459, 2.750422, 4.700696, 4.701008, 14.349139),
+                         MPE = c(-3.768316, -5.124982, -7.476301, -7.394738, -8.278004, -11.180243, -34.198384, -34.438195, -119.482980),
+                         MAPE = c(23.40163, 23.55276, 23.13448, 23.05037, 23.64924, 26.41330, 44.70273, 43.64248, 129.08697),
+                         MASE = c(0.9332286, 0.9415288, 0.9270130, 0.9255990, 0.9495569, 1.0516310, 1.7973231, 1.7974425, 5.4864301),
+                         RMSSE = c(0.8888389, 0.9020661, 0.9057719, 0.9068431, 0.9368454, 1.0574774, 1.7160548, 1.8307922, 6.5891805))
+
+# Create a GT table
+cv_arima_results %>% 
+  gt() %>% 
+  tab_style(
+    style = list(
+      cell_fill(color = "#2fa4e7")
+    ),
+    locations = list(cells_body(columns = RMSE, rows = RMSE == min(RMSE)),
+                     cells_body(columns = MAE, rows = MAE == min(MAE)),
+                     cells_body(columns = MPE, rows = abs(MPE) == min(abs(MPE))),
+                     cells_body(columns = MAPE, rows = MAPE == min(MAPE)),
+                     cells_body(columns = MASE, rows = MASE == min(MASE)),
+                     cells_body(columns = RMSSE, rows = RMSSE == min(RMSSE))
+    )
+  ) %>% 
+  tab_footnote(footnote = "Highlighted cells are minimums for each column of interest. Smaller is better, except for MAE, (closest to zero).") %>% 
+  tab_header(title = "ARIMA Cross-Validation Error Metrics")
+```
+
+Since we would like to minimize each of the error metrics, the cell containing the 
+minimum for each column has been highlighted in blue. ARIMA(0, 1, 2)(0, 1, 1)
+has the most minimums across error metrics, tied with ARIMA(1, 0, 0)(0, 1, 1). 
+
+However, we know that this model has significant issues with its residual autocorrelation 
+functions when it is fit to the whole data set. This is because it does not difference 
+the series non-seasonally and instead includes a drift parameter to compensate for the 
+trend of the series. This is not enough to remove all residual autocorrelation, and so
+this model should be considered unstable. 
+
+Therefore, we'll choose ARIMA(0, 1, 2)(0, 1, 1) as our final model. 
+
+## 5 ETS Modeling
+
+### 5.1 Discussion
+
+ARIMA is a fantastic tool that is often perfectly suitable for modeling a great 
+variety of time series data sets. However, it has a major limitation when it comes
+to modeling seasnality in data. 
+
+Although ARIMA can model some types of seasonality, it can only properly model 
+short period seasonality. In other words, its great for explaining monthly seasonality,
+and weekly seasonality, but it struggles as the period length increases. So, if we 
+wanted to model yearly seasonality with daily data, our model will not be able to handle such high
+peridocity, since we would have around 260 weekdays in a year (not 365, since we don't 
+look at weekends).
+
+If we extend the initial ACF plot of our series, we can see that we in fact do have yearly
+seasonality. 
+
+```{r}
+post_covid_daily_ridership %>% 
+  ACF(avg_boardings_trans, lag_max = 300) %>% 
+  autoplot() +
+  theme_minimal() +
+  labs(x = "Lag",
+       y = "AACF",
+       title = "Original ACF of Transformed Average Boardings")
+```
+
+The autocorrelations decay initially, but then spike up yet again once a new year
+starts to enter the picture. They reach a peak at around lag 260 because that is when the 
+first observationat time *t* is repeated at *t-260*.
+
+This complex seasonality cannot be modeled by ARIMA, since it does not like high
+periodicity and it can only handle one type of seasonality at a time. We have already
+included weekly seasonality, so we need to explore different models. 
+
+### 5.2 Time Series Decomposition
+
+Error-Trend-Seasonal models, better known as simply ETS, are a variety of exponential
+smoothing models that lay within the realm of state-space models in the literature. 
+State-space models take advantage of Markov processes, which include a measurement
+function and a state function. The state function is recalculated as the time series 
+progresses, reflecting a change of state in the data. You can read more about the details
+[here](https://otexts.com/fpp3/ets.html), and their applications to highly seasonal data
+[here](https://otexts.com/fpp3/complexseasonality.html). 
+
+ETS models can also be paired with Seasonal and Trend Decomposition using Loess (STL)
+methods. These help to decompose a time series into a trend component (up or down), 
+one or more seasonal components, and a remainder component, which tends to be white 
+noise when the previous components are filtered out. 
+
+They are very useful in modeling economic data, which researchers like to seasonally
+adjust to filter out cyclic activity and focus on only the trend.
+
+Below is our Ferry Boardings data, decomposed into various parts. 
+
+```{r, fig.width=10, fig.height=6}
+post_covid_daily_ridership %>% 
+  model(
+    STL(box_cox(avg_boardings, lambda) ~ season(5) + season(5*52),
+        robust = TRUE)
+  ) %>% 
+  components() %>% 
+  autoplot() +
+  theme_bw()
+```
+
+Our top series is just the original average boardings series, with the Box-Cox transformation
+applied. The trend component is tending upward, as expected. However, now we can 
+visualize the two seasonal components, separately. 
+
+The yearly seasonality is quite pronounced, which makes sense because time of year 
+must have some impact on the ridership of the ferry. Colder days with snowier weather
+tend to encourage people to take other modes of transportation, or just telework. This
+trend is very consistent. 
+
+The weekly seasonality is certainly more complex. The cycles are very small and repeat 
+with a greater frequency than the yearly seasonality does, so it can seem more **messy**. 
+The variation is not consistent, which also makes the graph look strange at first. 
+It's clear that the recovery of ferry system, and the MBTA transit system as a whole, 
+from Covid-19 is at work here. These transit systems were heavily disrupted by the 
+pandemic and as a result the variance of the weekly seasonality is changing as the 
+recovery effort progresses. 
+
+It's also important to note the vertical bars beside each series. Wider bars indicate
+relatively narrower scales, whereas narrower bars indicate wider scales. So, we can 
+compare both of our seasonal components and conclude that the yearly seasonality is strong
+and the weekly seasonality is relatively weak, although still present. 
+
+We can also visualize the trend overlayed on top of the original series. 
+
+```{r}
+components <- post_covid_daily_ridership %>% 
+  model(
+    STL(box_cox(avg_boardings, lambda) ~ season(5) + season(5*52),
+        robust = TRUE)
+  ) %>% 
+  components()
+
+# Trend graph
+components %>% 
+  as_tsibble() %>% 
+  autoplot(`box_cox(avg_boardings, lambda)`, color = "gray") +
+  geom_line(aes(y = trend), color = "#007aff") +
+  theme_minimal() +
+  labs(y = "Transformed Average Ferry Boardings",
+       x = "Time Step")
+```
+
+This graph isn't especially useful, even if it is nice to look at. However, it is
+reassuring since it conveys that, while a simple upward trend explains a lot about
+the series, the seasonality plays an important role as well (especially the yearly
+one).
+
+### 5.3 ETS Fitting and Evaluation
+
+ETS is great because there are automatic model fitting algorithms that do a very good
+job at specifying a model. This contrasts with ARIMA, where manual model selection,
+when performed correctly, is more time consuming and subjective. 
+
+We fit and cross validate using STL to decompose the series, and model the seasonal
+components using ETS, below.
+
+```{r}
+# Specify formula of model
+my_dcmp_spec <- decomposition_model(
+  STL(box_cox(avg_boardings, lambda) ~ season(5) + season(5*52),
+      robust = TRUE),
+  ETS(season_adjust ~ season("N"))
+)
+```
+
+Again, cross-validation is resource intensive so I have commented out the lines of code below. 
+
+```{r}
+# cv_ETS_results <- cv_data %>% 
+#   model(my_dcmp_spec) %>% 
+#   forecast(h = 14) %>% 
+#   accuracy(post_covid_daily_ridership) 
+```
+
+I've placed the results that I obtained after cross-validating (using the same subsets
+as before) down below. 
+
+```{r}
+cv_ETS_results <- data.frame(.model = c("my_dcmp_spec"),
+                         .type = rep("Test", times = 1),
+                         ME = c(-0.04352693),
+                         RMSE = c(3.364336),
+                         MAE = c(2.491663),
+                         MPE = c(-6.2999),
+                         MAPE = c(23.78435),
+                         MASE = c(0.9526937),
+                         RMSSE = c(0.9275948))
+```
+
+We can now compare the results for this model with our best ARIMA model.
+
+```{r}
+cv_ETS_results %>% 
+  rbind(cv_arima_results %>% 
+          filter(.model == "arima_012_011")) %>% 
+    gt() %>% 
+  tab_style(
+    style = list(
+      cell_fill(color = "#2fa4e7")
+    ),
+    locations = list(cells_body(columns = RMSE, rows = RMSE == min(RMSE)),
+                     cells_body(columns = MAE, rows = MAE == min(MAE)),
+                     cells_body(columns = MPE, rows = abs(MPE) == min(abs(MPE))),
+                     cells_body(columns = MAPE, rows = MAPE == min(MAPE)),
+                     cells_body(columns = MASE, rows = MASE == min(MASE)),
+                     cells_body(columns = RMSSE, rows = RMSSE == min(RMSSE))
+    )
+  ) %>% 
+  tab_footnote(footnote = "Highlighted cells are minimums for each column of interest. Smaller is better, except for MAE, (closest to zero).") %>% 
+  tab_header(title = "ARIMA and ETS Cross-Validation Error Metrics")
+```
+
+At first glance it appears that ARIMA is still outperforming the STL/ETS model. 
+However, this comparison is not exactly equal. One of the drawbacks of ETS and 
+yearly seasonality is that the model needs to observe a full year of data to adequately
+understand the seasonal effects.
+
+As a result, this comparison is not actually informative or valid. 
+
+We could recreate the many subsets of training data so that they each include a year's
+worth of data (about 260 observations) and perform the cross-validation of the STL/ETS
+model on that. But, those results wouldn't be comparable to the ARIMA cross-validation 
+results either, since now the ARIMA models have less training data to work with. 
+
+I think it is best to simply test both models using last-block validation (simple
+train-test split). We'll do this after we have finished creating our next model:
+Dynamic Harmonic Regression. 
+
+## 6 Dynamic Harmonic Regression Modeling
+
+### 6.1 Discussion
+
+Dynamic Harmonic Regression sounds fancy and complicated. It is actually not particularly complicated, 
+even if it is fancy, since we are actually just using Fourier terms as regressors 
+in a model regression equation. 
+
+Fourier terms are included because they do a remarkable job at modeling cyclicity with
+their sine and cosine functions. This makes it useful for modeling seasonality; in fact,
+they are capable of modeling any length of seasonality. The **dynamic** key word in 
+the phrase *Dynamic Harmonic Regression* refers to the use of an ARIMA model to 
+model the errors. This allows Fourier terms to handle seasonality and ARIMA to 
+handle short term effects and upward/downward trends. 
+
+### 6.2 Model Fitting and Cross-Validation
+
+Choosing these models also partly relies on the intuition learned from the time series
+decomposition we used earlier, although not directly. We learned from it that our
+weekly seasonality was somewhat weaker compared to the yearly seasonality we saw. 
+
+So, when we choose the number of Fourier terms to include for each seasonal component, 
+we can base the choice on the relative strength of each seasonality.
+
+Below, we specify the K in each Fourier component for number of candidate models. 
+The choice of K should not exceed the seasonal period divided by 2. So, for our 
+weekly seasonality, we'll have to either specify 1 or 2, but no more. This is for computational
+reasons. We'll keep this to 2 in all cases. 
+
+For yearly seasonality, our maximum number of terms is 260/2, or 130. 130 is far too
+many terms and will undoubtedly over smooth the results and produce poor forecasts. 
+So, we'll vary K at more reasonable values.  
+
+```{r}
+# Create cross-validation subsets, each with a year's worth of training data. 
+cv_yearly_data <- post_covid_daily_ridership %>% 
+  slide_tsibble(.size = 260, .step = 1) %>% 
+  filter(!(.id %in% max(.id):(max(.id) - 13)))
+```
+
+```{r}
+# Create cross-validated models and obtain results
+# cv_dnr_results <- cv_yearly_data %>% 
+#   model(
+#     dnr_5 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                   fourier(period = 5, K = 2) + fourier(period = 5*52, K = 5)),
+#     dnr_6 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                   fourier(period = 5, K = 2) + fourier(period = 5*52, K = 6)),
+#     dnr_7 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                   fourier(period = 5, K = 2) + fourier(period = 5*52, K = 7)),
+#     dnr_8 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 8)),
+#     dnr_9 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 9)),
+#     dnr_10 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 10)),
+#     dnr_11 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 11)),
+#     dnr_12 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 12)),
+#     dnr_13 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 13)),
+#     dnr_14 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 14)),
+#     dnr_15 = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0) + pdq(d = 0) +
+#                     fourier(period = 5, K = 2) + fourier(period = 5*52, K = 15))
+#     
+#   ) %>% 
+#   forecast(h = 14) %>% 
+#   accuracy(post_covid_daily_ridership) 
+```
+
+Again, we've commented out the cross-validation code. We'll store the results in
+a data frame and compare each of the models.
+
+```{r}
+cv_dnr_results <- data.frame(.model = c("dnr_5", "dnr_6", "dnr_7", "dnr_8", "dnr_9" ,"dnr_10", "dnr_11", "dnr_12", "dnr_13", "dnr_14", "dnr_15"),
+                             .type = rep("Test", times = 11),
+                             ME = c(3.682696, 3.869685, 4.023506, 4.160865, 4.261606, 4.356978, 4.435123, 4.475619, 4.510217, 4.539399, 4.557391),
+                             RMSE = c(5.355303, 5.548950, 5.713068, 5.864727, 5.964027, 6.064047, 6.142938, 6.193078, 6.223786, 6.260457, 6.282534),
+                             MAE = c(4.358360, 4.526195, 4.660325, 4.778216, 4.866546, 4.959289, 5.025089, 5.049881, 5.080224, 5.113365, 5.125475),
+                             MPE = c(22.73037, 24.24944, 25.43780, 26.52154, 27.31910, 28.02153, 28.66569, 28.97693, 29.31273, 29.51775, 29.65168),
+                             MAPE = c(30.79498, 31.91541, 32.79894, 33.58833, 34.14775, 34.79158, 35.16298, 35.40930, 35.64543, 35.84333, 35.89459),
+                             MASE = c(1.666430, 1.730602, 1.781887, 1.826963, 1.860736, 1.896197, 1.921356, 1.930835, 1.942436, 1.955108, 1.959739),
+                             RMSSE = c(1.476532, 1.529924, 1.575173, 1.616988, 1.644366, 1.671943, 1.693694, 1.707519, 1.715985, 1.726096, 1.732183))
+
+# Create the GT table
+cv_dnr_results %>%
+    gt() %>% 
+  tab_style(
+    style = list(
+      cell_fill(color = "#2fa4e7")
+    ),
+    locations = list(cells_body(columns = RMSE, rows = RMSE == min(RMSE)),
+                     cells_body(columns = MAE, rows = MAE == min(MAE)),
+                     cells_body(columns = MPE, rows = abs(MPE) == min(abs(MPE))),
+                     cells_body(columns = MAPE, rows = MAPE == min(MAPE)),
+                     cells_body(columns = MASE, rows = MASE == min(MASE)),
+                     cells_body(columns = RMSSE, rows = RMSSE == min(RMSSE))
+    )
+  ) %>% 
+  tab_footnote(footnote = "Highlighted cells are minimums for each column of interest. Smaller is better, except for MAE, (closest to zero).") %>% 
+  tab_header(title = "Dynamic Harmonic Regression Cross-Validation Error Metrics")
+```
+
+Judging by the table, we should use K=5 for our yearly seasonal specification. 
+Therefore, we'll have a total of 10 Fourier terms (5 sine and 5 cosine) for the yearly
+seasonal component. 
+
+## 7 Model Forecasting
+
+We have spent our time so far determining what the optimal model specification is
+for each of the three types of models discussed: ARIMA, STL/ETS, and Dynamic Harmonic Regression.
+Now that we have determined what those are, we can begin generating forecasts for each of them. 
+
+But first, we need to create a final train-test split for our data. We'll leave out 
+20 observations for the test set and keep 805 in the training set. In essence, we'll be forecasting 
+4 weeks ahead (recall we only forecast weekday boardings).
+
+```{r}
+train_data <- post_covid_daily_ridership[1:(nrow(post_covid_daily_ridership) - 20), ]
+test_data <- post_covid_daily_ridership[(nrow(post_covid_daily_ridership) - 19):nrow(post_covid_daily_ridership), ]
+```
+
+### 7.1 Generate Forecasts and Prediction Intervals
+
+We'll use the block of code below fit each model. The call to mutate that they 
+are piped into contains an expression that essentially **adds** the models together. 
+
+```{r}
+all_models <- train_data %>% 
+  model(
+    ARIMA = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 2) + PDQ(0, 1, 1, period = 5)),
+    STL_ECS = my_dcmp_spec,
+    DNR = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0)  +
+                  fourier(period = 5, K = 2) + fourier(period = 5*52, K = 5))
+  ) %>% 
+  mutate(combination = (ARIMA + STL_ECS + DNR) / 3)
+```
+
+Technically, the models are not added. It is an expression that `fable` and `fabletools`
+understand and can use to generate forecasts. We'll generate the forecasts now
+
+```{r}
+all_forecasts <- all_models %>% 
+  forecast(h = 20)
+```
+
+and then create the prediction intervals. 
+
+```{r}
+all_intervals <- all_forecasts %>%
+  hilo()
+```
+
+Below, we have created a new data frame that we can pass to a call to ggplot2 functions
+to generate a time series chart that compares each of the models' forecasts to the 
+actual test data. 
+
+```{r}
+all_plot_data <- data.frame(.model = all_intervals$.model,
+                            date = test_data$new_date,
+                            actual = test_data$avg_boardings,
+                            point_forecast = all_intervals$.mean,
+                            low_80 = all_intervals$`80%`$lower,
+                            high_80 = all_intervals$`80%`$upper,
+                            low_95 = all_intervals$`95%`$lower,
+                            high_95 = all_intervals$`95%`$upper)
+```
+
+First, we'll create the graph for the Dynamic Harmonic Regression. The code for this, like the others that will follow, 
+will initially be hidden since they take up so much space. If you're curious, you can
+show the code by clicking the show button to the right of each. 
+
+```{r, class.source='fold-hide'}
+dnr_plot <- ggplot() +
+    geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+              mapping = aes(x = new_date, y = avg_boardings),
+              color = "#007aff") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "DNR"),
+                mapping = aes(ymin = low_95, ymax = high_95, x = date),
+                fill = "#ffe4bf") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "DNR"),
+                mapping = aes(ymin = low_80, ymax = high_80, x = date),
+                fill = "#ffaf3f") +
+    geom_line(data = all_plot_data %>% filter(.model == "DNR"), 
+              mapping = aes(x = date, y = point_forecast),
+              color = "#ED8B00") +
+    geom_line(data = all_plot_data %>% filter(.model == "DNR"), 
+              mapping = aes(x = date, y = actual),
+              color = "#007aff") +
+    theme_minimal() +
+    labs(y = "Average Boardings",
+         x = "",
+         title = "Dynamic Harmonic Regression")
+```
+
+Next the graph for the STL/ECS model.
+
+```{r, class.source='fold-hide'}
+ETS_plot <- ggplot() +
+    geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+              mapping = aes(x = new_date, y = avg_boardings),
+              color = "#007aff") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ECS"),
+                mapping = aes(ymin = low_95, ymax = high_95, x = date),
+                fill = "#f9d4d1") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ECS"),
+                mapping = aes(ymin = low_80, ymax = high_80, x = date),
+                fill = "#ed7f77") +
+    geom_line(data = all_plot_data %>% filter(.model == "STL_ECS"), 
+              mapping = aes(x = date, y = point_forecast),
+              color = "#DA291C") +
+    geom_line(data = all_plot_data %>% filter(.model == "STL_ECS"), 
+              mapping = aes(x = date, y = actual),
+              color = "#007aff") +
+    theme_minimal() +
+    labs(x = "", 
+         y = "",
+         title = "STL/ECS")
+```
+
+The ARIMA model.
+
+```{r, class.source='fold-hide'}
+ARIMA_plot <- ggplot() +
+    geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+              mapping = aes(x = new_date, y = avg_boardings),
+              color = "#007aff") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "ARIMA"),
+                mapping = aes(ymin = low_95, ymax = high_95, x = date),
+                fill = "#feccfe") +
+    geom_ribbon(data = all_plot_data %>% filter(.model == "ARIMA"),
+                mapping = aes(ymin = low_80, ymax = high_80, x = date),
+                fill = "#ff66ff") +
+    geom_line(data = all_plot_data %>% filter(.model == "ARIMA"), 
+              mapping = aes(x = date, y = point_forecast),
+              color = "#660066") +
+    geom_line(data = all_plot_data %>% filter(.model == "ARIMA"), 
+              mapping = aes(x = date, y = actual),
+              color = "#007aff") +
+    theme_minimal() +
+    labs(x = "Date",
+         y = "Average Boardings",
+         title = "ARIMA")
+```
+
+And finally the combination forecast.
+
+```{r, class.source='fold-hide'}
+combination_plot <- ggplot() +
+    geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+              mapping = aes(x = new_date, y = avg_boardings),
+              color = "#007aff") +
+    geom_line(data = all_plot_data %>% filter(.model == "combination"), 
+              mapping = aes(x = date, y = point_forecast),
+              color = "#1a7e2e") +
+    geom_line(data = all_plot_data %>% filter(.model == "combination"), 
+              mapping = aes(x = date, y = actual),
+              color = "#007aff") +
+    theme_minimal() +
+    labs(x = "Date",
+         y = "",
+         title = "Combination Forecast")
+```
+
+```{r, fig.width=10, fig.height=6}
+grid.arrange(
+  dnr_plot,
+  ETS_plot,
+  ARIMA_plot,
+  combination_plot,
+  ncol = 2
+)
+```
+
+### 7.2 Some Discussion
+
+There is a lot to unpack regarding the plot above. First, you'll notice that the 
+combination forecast is not accompanied by a prediction interval, while the others
+are. This is because, while we can easily generate combination point forecasts by simply averaging 
+the point forecasts of the other models. However, generating the distribution 
+for the combination forecast is much more complex. 
+
+We can do this, but we haven't yet in order to highlight another interesting point. 
+The ARIMA model's forecasts are atrocious. The model assumes that the upward trend present 
+in the series will continue in the test data. But the test data is beginning to slowly
+trend downwards due to the yearly seasonality patterns that the ARIMA model does
+NOT take into account. 
+
+The test data points all are from the month of August, which is typically when weather
+starts to get colder in Boston and the surrounding area. So, the apex of the yearly seasonal 
+pattern typically occurs around August, maybe September. That is also when ridership 
+decreases. 
+
+Since ARIMA cannot model multiple seasonal trends, it should be concluded that it is
+not suitable and we should also create a combination forecast that only average the forecasts
+of the other two models. 
+
+Which brings us to the next point of discussion. The Dynamic Harmonic Regression and the 
+ETS model both perform quite well. Most of the test data falls within the prediction intervals. 
+The only test data point that is well outside of both is the date Auguest 25th, 2023. 
+This Friday has an unusually low value, even wen considering the shift to a downward trend. 
+
+Its value is about 9.26 average weekday boardings. I could find no reason why the 
+number of boardings was so low, so we have to conclude that it is simply an unusual
+data point, an outlier. 
+
+Lastly, notice how the DNR model looks like it is noticing the upcoming downward 
+trend. This is because the underlying model uses the Fourier terms to model the 
+seasonality, and it actually assumes that this seasonality remains constant. 
+The ETS model also tends to recognize the change in trend, but not quite as well. 
+
+As it turns out, the ETS model outperforms the others by a large margin. It wins
+in all the relevant error metrics. 
+
+The quantitative results of the forecasting are in the table below. 
+
+```{r}
+all_forecasts %>% 
+  accuracy(post_covid_daily_ridership) %>% 
+  as.data.frame() %>% 
+  select(-c(ACF1)) %>% 
+  gt() %>% 
+  tab_style(
+    style = list(
+      cell_fill(color = "#2fa4e7")
+    ),
+    locations = list(cells_body(columns = RMSE, rows = RMSE == min(RMSE)),
+                     cells_body(columns = MAE, rows = MAE == min(MAE)),
+                     cells_body(columns = MPE, rows = abs(MPE) == min(abs(MPE))),
+                     cells_body(columns = MAPE, rows = MAPE == min(MAPE)),
+                     cells_body(columns = MASE, rows = MASE == min(MASE)),
+                     cells_body(columns = RMSSE, rows = RMSSE == min(RMSSE))
+    )
+  ) %>% 
+  tab_footnote(footnote = "Highlighted cells are minimums for each column of interest. Smaller is better, except for MAE, (closest to zero).") %>% 
+  tab_header(title = "Out-of-Sample Forecast Accuracy")
+```
+
+### 7.3 Revisiting Combination Forecasts
+
+Since we have determined that ARIMA actually hinders the combination forecasts, 
+we should remove it and recalculate the combination. 
+
+```{r}
+relevant_models <- train_data %>% 
+  model(
+    STL_ECS = my_dcmp_spec,
+    DNR = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0)  +
+                  fourier(period = 5, K = 2) + fourier(period = 5*52, K = 5))
+  ) %>% 
+  mutate(combination = (STL_ECS + DNR) / 2)
+```
+
+Next we'll produce the forecasts and generate the combined error distribution.
+
+```{r, warning=FALSE}
+final_forecasts <- relevant_models %>% 
+  generate(h = 20, times = 1000) %>% 
+  as_tsibble() %>% 
+  group_by(.model) %>% 
+  summarize(
+    dist = distributional::dist_sample(list(.sim))
+  ) %>% 
+  ungroup() %>% 
+  as_fable(index = day_index, key = .model,
+           distribution = dist, response = "avg_boardings") %>% 
+  filter(.model == "combination")
+```
+
+```{r}
+final_forecast_intervals <- final_forecasts %>% 
+  filter(.model == "combination") %>% 
+  hilo()
+```
+
+Create the plotting data frame. 
+
+```{r}
+final_forecast_plot_data <- data.frame(.model = final_forecast_intervals$.model,
+                                       date = test_data$new_date,
+                                       actual = test_data$avg_boardings,
+                                       point_forecast = final_forecast_intervals$dist %>% mean(),
+                                       low_80 = final_forecast_intervals$`80%`$lower,
+                                       high_80 = final_forecast_intervals$`80%`$upper,
+                                       low_95 = final_forecast_intervals$`95%`$lower,
+                                       high_95 = final_forecast_intervals$`95%`$upper)
+```
+
+And lastly we'll plot the data. 
+
+```{r}
+ggplot() +
+    geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+              mapping = aes(x = new_date, y = avg_boardings),
+              color = "#007aff") +
+    geom_ribbon(data = final_forecast_plot_data,
+                mapping = aes(ymin = low_95, ymax = high_95, x = date),
+                fill = "#aaedb7") +
+    geom_ribbon(data = final_forecast_plot_data,
+                mapping = aes(ymin = low_80, ymax = high_80, x = date),
+                fill = "#55dc70") +
+    geom_line(data = final_forecast_plot_data, 
+              mapping = aes(x = date, y = point_forecast),
+              color = "#1a7e2e") +
+    geom_line(data = final_forecast_plot_data, 
+              mapping = aes(x = date, y = actual),
+              color = "#007aff") +
+    theme_minimal() +
+    labs(x = "Date",
+         y = "Average Boardings",
+         title = "Combination Forecast of Average Ferry Boardings")
+```
+
+The forecasts look quite similar to the DNR model, with some slight differences 
+due to the combination with the ETS forecasts. 
+
+We'll make another table comparing these forecasts with the DNR and the ETS models. 
+
+```{r}
+final_forecasts %>% 
+  accuracy(post_covid_daily_ridership) %>% 
+  as.data.frame() %>% 
+  select(-c(ACF1)) %>% 
+  rbind(all_forecasts %>% 
+          accuracy(post_covid_daily_ridership) %>% 
+          as.data.frame() %>% 
+          select(-c(ACF1)) %>%
+          filter(.model %in% c("DNR", "STL_ECS"))) %>% 
+  gt() %>% 
+  tab_style(
+    style = list(
+      cell_fill(color = "#2fa4e7")
+    ),
+    locations = list(cells_body(columns = RMSE, rows = RMSE == min(RMSE)),
+                     cells_body(columns = MAE, rows = MAE == min(MAE)),
+                     cells_body(columns = MPE, rows = abs(MPE) == min(abs(MPE))),
+                     cells_body(columns = MAPE, rows = MAPE == min(MAPE)),
+                     cells_body(columns = MASE, rows = MASE == min(MASE)),
+                     cells_body(columns = RMSSE, rows = RMSSE == min(RMSSE))
+    )
+  ) %>% 
+  tab_footnote(footnote = "Highlighted cells are minimums for each column of interest. Smaller is better, except for MAE, (closest to zero).") %>% 
+  tab_header(title = "Out-of-Sample Forecast Accuracy")
+```
+
+### 7.4 Final Discussion on Results
+
+We can see that, despite removing ARIMA from the combination forecast equation, 
+the combinations are inadequate compared to the STL/ETS forecasts. In many cases combination
+forecasts improve performance, but not in all cases. 
+
+I believe that this result stems from the fact that ARIMA cannot adequately model
+all types of seasonality and can't even model multiple seasonality. Dynamic
+Harmonic Regression, while still a decent choice, performs worse than ETS. The reason
+for this may be that DNR tends to overfit models, since it uses a large number of 
+parameters.
+
+In our case, the DNR model had 4 parameters for weekly seasonality, 10 for yearly 
+seasonality, and 6 combined moving average and autoregressive parameters for modeling
+the errors. 20 parameters is a lot compared to the ETS model, which was essentially 
+a seasonal random walk model (for both seasonalities) with a simple exponential smoother
+with additive errors (ETS[A, N, N]). In other words, we only estimated a single parameter
+for the exponential smoother applied to the seasonally adjusted component of the series (alpha).
+
+Many analysts, statisticians, and data scientists will parrot the old saying of simplicity is
+often better. They are usually right, and it turns out that is correct in our case as well. 
+
+## 8 Improvements
+
+To finish off the work we have done here, I would like to suggest some improvements
+to the work. 
+
+1. We aggregated the data according to day. We obtained astonishingly good forecasts,
+despite one observation (an outlier) existing outside of the prediction intervals for the 
+STL/ETS model. 
+    * Perhaps foregoing the aggregation by day and instead aggregating by hour would be more appropriate. 
+    * It's certainly reasonable to assume that a daily seasonality exists over the course of 
+    24 hours (or however many hours the ferries are operational).
+2. Apply vector autoregression, or add exogenous predictor variables, including 
+variables that measure impactful weather. 
+    * We've seen data points representing canceled days due to weather. Maybe including variables
+    for rainfall and snowfall could influence decreases in ridership even when services
+    are not cancelled. 
+
+These are the two most interesting and obvious routes to explore. There could be additional 
+variables that I have not thought of that could also be included as predictors for 
+average ridership. 
+
+If you have any ideas on how to improve this work, please do not hesitate to reach out
+and make suggestions. This is a very interesting problem involving a highly complex, seasonal
+set of data, and I think time series analysis has a real application here. 
+
+***Thank you for reading!!!***
+

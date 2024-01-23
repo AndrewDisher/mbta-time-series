@@ -1,0 +1,34 @@
+
+/* --- Styles for Headings --- */ 
+h1, h2, h3, h4, h5, h6, .h1, .h2, .h3, .h4, .h5, .h6 {
+    font-family: "Helvetica Neue",Helvetica,Arial,sans-serif;
+    font-weight: 500;
+    line-height: 1.2;
+    color: #2fa4e7;
+}
+
+/* --- Style for Inline Code --- */
+code {
+  background-color: #def0fb;
+  border-radius: 6px;
+}
+
+/* --- Styles for Table of Contents --- */ 
+.list-group-item:hover {
+  background: #8cccf1;
+  color: #ffffff;
+}
+
+/* --- Style for Code Blocks --- */
+pre {
+  background-color: #def0fb;
+}
+
+pre:not([class]) {
+  background-color: #e3e7e9 !important;
+}
+
+/* --- Style for Main Container --- */
+div.main-container {
+    max-width: 1600px !important;
+}
