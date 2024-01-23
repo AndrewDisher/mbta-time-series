@@ -87,10 +87,14 @@ box::use(functions/plotting[time_series])
 and then, as an example, ask for the documentation for the function `model_diagnostics` by running
 
 ```
-box::help(time_series$model_diagnostics)
+box::help(time_series$plotHist)
 ```
 
 This will give you a help page describing the function's purpose, its input arguments and types, its output, and some examples. 
+
+Below is an image for what you can expect for when running the previous help command in the R console.
+
+![example help documentation](images/documentation_ex.png)
 
 ## Acknowledgements
 
