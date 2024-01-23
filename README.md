@@ -30,7 +30,7 @@ below, where the model forecasted 4 weeks (20 observations, 5 for each weekday i
 
 These forecasts outperformed ARIMA, DNR, and a combination ensemble forecast produced with the models, making it the clear winner. What is especially interesting about the ETS
 model is that, since it can handle the diverse and complex seasonality within the data, it was able to realize that the data being forecast existed just as the series
-was at its yearly seasonal apex, and began to trend downwards to compensate. 
+was at its yearly seasonal apex, and began to slightly trend downwards to compensate. 
 
 ARIMA could never have done that, and Dynamic Harmonic Regression, while able to to, didn't produce great forecasts. 
 
