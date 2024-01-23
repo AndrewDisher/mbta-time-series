@@ -436,15 +436,15 @@ cv_data %>%
 # -----------------------------
 
 # Produce train test split for all data
-train_data <- post_covid_daily_ridership[1:(nrow(post_covid_daily_ridership) - 14), ]
-test_data <- post_covid_daily_ridership[(nrow(post_covid_daily_ridership) - 13):nrow(post_covid_daily_ridership), ]
+train_data <- post_covid_daily_ridership[1:(nrow(post_covid_daily_ridership) - 20), ]
+test_data <- post_covid_daily_ridership[(nrow(post_covid_daily_ridership) - 19):nrow(post_covid_daily_ridership), ]
 
 # Train the models on all previous data, and produce forecasts
 model_forecasts <- train_data %>% 
   model(
     arima_012_011 = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(1, 1, 1) + PDQ(0, 1, 1, period = 5))
   ) %>% 
-  forecast(h = 14, bootstrap = TRUE) 
+  forecast(h = 20, bootstrap = TRUE) 
 
 # Extract information about the confidence intervals
 intervals <- model_forecasts %>% 
@@ -534,7 +534,7 @@ my_dcmp_spec <- decomposition_model(
 # Create a models using each of these training sets to obtain 
 cv_ETS_results <- cv_data %>% 
   model(my_dcmp_spec) %>% 
-  forecast(h = 14) %>% 
+  forecast(h = 20) %>% 
   accuracy(post_covid_daily_ridership) 
 
 cv_ETS_results
@@ -550,7 +550,7 @@ cv_yearly_data <- post_covid_daily_ridership %>%
 
 cv_ETS_results <- cv_yearly_data %>% 
   model(my_dcmp_spec) %>% 
-  forecast(h = 14) %>% 
+  forecast(h = 20) %>% 
   accuracy(post_covid_daily_ridership) 
 
 cv_ETS_results
@@ -580,7 +580,7 @@ ETS_model_info %>%
 
 # Generate forecasts
 STL_ETS_forecasts <- STL_ETS_model %>% 
-  forecast(h = 14) 
+  forecast(h = 20) 
 
 
 # Produce a data frame suitable for plotting
@@ -599,7 +599,7 @@ STL_ETS_plot_data <- data.frame(date = test_data$new_date,
 
 # Construct the ggplot graph
 ggplot() +
-  geom_line(data = train_data[(nrow(train_data) - 56):nrow(train_data),], 
+  geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
             mapping = aes(x = new_date, y = avg_boardings),
             color = "#007aff") +
   geom_ribbon(data = STL_ETS_plot_data,
@@ -838,6 +838,33 @@ future_forecasts |>
        title = "Forecast Combination of Average Ferry Boardings")
 
 
+# ---------------------------------
+# ----- Graph for GitHub Repo -----
+# ---------------------------------
+
+color_pal <- c("Actual" = "#007aff",
+               "Predicted" = "#ED8B00")
+
+fill_pal <- c("80% PI" = "#ffaf3f",
+             "95% PI" = "#ffe4bf")
+
+ggplot() +
+  geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
+            mapping = aes(x = new_date, y = avg_boardings, color = "Actual")) +
+  geom_ribbon(data = STL_ETS_plot_data,
+              mapping = aes(ymin = low_95, ymax = high_95, x = date, fill = "95% PI")) +
+  geom_ribbon(data = STL_ETS_plot_data,
+              mapping = aes(ymin = low_80, ymax = high_80, x = date, fill = "80% PI")) +
+  geom_line(data = STL_ETS_plot_data, 
+            mapping = aes(x = date, y = point_forecast, color = "Predicted")) +
+  geom_line(data = STL_ETS_plot_data, 
+            mapping = aes(x = date, y = actual, color = "Actual")) +
+  theme_minimal() +
+  labs(x = "Date",
+       y = "Average Boardings",
+       title = "STL/ETS Forecasts of Average Ferry Boardings") +
+  scale_color_manual(values = color_pal, name = "Values") +
+  scale_fill_manual(values = fill_pal, name = "Prediction Intervals")
 
 
 
