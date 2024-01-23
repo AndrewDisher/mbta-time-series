@@ -1042,11 +1042,11 @@ are piped into contains an expression that essentially **adds** the models toget
 all_models <- train_data %>% 
   model(
     ARIMA = ARIMA(box_cox(avg_boardings, lambda) ~ pdq(0, 1, 2) + PDQ(0, 1, 1, period = 5)),
-    STL_ECS = my_dcmp_spec,
+    STL_ETS = my_dcmp_spec,
     DNR = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0)  +
                   fourier(period = 5, K = 2) + fourier(period = 5*52, K = 5))
   ) %>% 
-  mutate(combination = (ARIMA + STL_ECS + DNR) / 3)
+  mutate(combination = (ARIMA + STL_ETS + DNR) / 3)
 ```
 
 Technically, the models are not added. It is an expression that `fable` and `fabletools`
@@ -1106,29 +1106,29 @@ dnr_plot <- ggplot() +
          title = "Dynamic Harmonic Regression")
 ```
 
-Next the graph for the STL/ECS model.
+Next the graph for the STL/ETS model.
 
 ```{r, class.source='fold-hide'}
 ETS_plot <- ggplot() +
     geom_line(data = train_data[(nrow(train_data) - 40):nrow(train_data),], 
               mapping = aes(x = new_date, y = avg_boardings),
               color = "#007aff") +
-    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ECS"),
+    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ETS"),
                 mapping = aes(ymin = low_95, ymax = high_95, x = date),
                 fill = "#f9d4d1") +
-    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ECS"),
+    geom_ribbon(data = all_plot_data %>% filter(.model == "STL_ETS"),
                 mapping = aes(ymin = low_80, ymax = high_80, x = date),
                 fill = "#ed7f77") +
-    geom_line(data = all_plot_data %>% filter(.model == "STL_ECS"), 
+    geom_line(data = all_plot_data %>% filter(.model == "STL_ETS"), 
               mapping = aes(x = date, y = point_forecast),
               color = "#DA291C") +
-    geom_line(data = all_plot_data %>% filter(.model == "STL_ECS"), 
+    geom_line(data = all_plot_data %>% filter(.model == "STL_ETS"), 
               mapping = aes(x = date, y = actual),
               color = "#007aff") +
     theme_minimal() +
     labs(x = "", 
          y = "",
-         title = "STL/ECS")
+         title = "STL/ETS")
 ```
 
 The ARIMA model.
@@ -1257,11 +1257,11 @@ we should remove it and recalculate the combination.
 ```{r}
 relevant_models <- train_data %>% 
   model(
-    STL_ECS = my_dcmp_spec,
+    STL_ETS = my_dcmp_spec,
     DNR = ARIMA(box_cox(avg_boardings, lambda) ~ PDQ(0, 0, 0)  +
                   fourier(period = 5, K = 2) + fourier(period = 5*52, K = 5))
   ) %>% 
-  mutate(combination = (STL_ECS + DNR) / 2)
+  mutate(combination = (STL_ETS + DNR) / 2)
 ```
 
 Next we'll produce the forecasts and generate the combined error distribution.
@@ -1338,7 +1338,7 @@ final_forecasts %>%
           accuracy(post_covid_daily_ridership) %>% 
           as.data.frame() %>% 
           select(-c(ACF1)) %>%
-          filter(.model %in% c("DNR", "STL_ECS"))) %>% 
+          filter(.model %in% c("DNR", "STL_ETS"))) %>% 
   gt() %>% 
   tab_style(
     style = list(
