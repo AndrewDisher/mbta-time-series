@@ -26,6 +26,8 @@ In the end, a suitable Error-Trend-Seasonal (ETS) model was obtained, accompanie
 outperformed both ARIMA and Dynamic Harmonic Regression forecasts and was able to explain the complex seasonality within the data. A sample graph is showm
 below, where the model forecasted 4 weeks (20 observations, 5 for each weekday in a week) of test data and produced remarkably good results. 
 
+![Image for ETS Foreacsts](images/ETS_forecasts.png)
+
 ## Local Project Download
 
 To view each of the files in a local project, first clone this repository or download the files in a .zip file. 
